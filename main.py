@@ -2,14 +2,33 @@ from fastapi import FastAPI, UploadFile, File, Body
 from pydantic import BaseModel
 import fitz
 import ollama
+import re
+import json
 import os
 import uuid
 import json
 import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from vector_store import get_collection
+from db import init_db, save_result, get_student_stats
+from db import get_wrong_questions
+from db import get_all_students, get_student_summary
+from db import get_recent_wrong_questions
+from db import get_wrong_summary
+
+init_db()
 
 app = FastAPI()
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -19,6 +38,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 class QuestionRequest(BaseModel):
     file_id: str
     question: str
+
+class AdaptiveQuizRequest(BaseModel):
+    student_id: str
+    file_id: str
+    num_questions: int = 5
 
 
 # ----------- Routes -----------
@@ -130,14 +154,9 @@ Answer:
     )
 
     return {
-        "file_id": file_id,
-        "question": question,
-        "answer": response["message"]["content"],
-        "chunks_used": [
-            {"chunk_no": i+1, "metadata": retrieved_meta[i], "text": retrieved_docs[i]}
-            for i in range(len(retrieved_docs))
-        ]
+    "answer": response["message"]["content"]
     }
+
 class SummaryRequest(BaseModel):
     file_id: str
 
@@ -247,6 +266,193 @@ Material:
         quiz_list = []
 
     return {
+        "file_id": req.file_id,
+        "quiz": quiz_list
+    }
+class SubmitQuizRequest(BaseModel):
+    student_id: str
+    file_id: str
+    responses: list  # [{"question": "...", "selected": "A", "correct": "B"}]
+
+
+@app.post("/submit-quiz/")
+async def submit_quiz(req: SubmitQuizRequest):
+    correct_count = 0
+
+    for r in req.responses:
+        question = r["question"]
+        selected = r["selected"]
+        correct = r["correct"]
+
+        is_correct = 1 if selected == correct else 0
+        if is_correct:
+            correct_count += 1
+
+        save_result(
+            student_id=req.student_id,
+            file_id=req.file_id,
+            question=question,
+            selected_option=selected,
+            correct_option=correct,
+            is_correct=is_correct
+        )
+
+    total = len(req.responses)
+
+    return {
+        "student_id": req.student_id,
+        "file_id": req.file_id,
+        "score": f"{correct_count}/{total}",
+        "percentage": (correct_count / total) * 100
+    }
+class ProgressRequest(BaseModel):
+    student_id: str
+    file_id: str
+
+
+@app.post("/student-progress/")
+async def student_progress(req: ProgressRequest):
+    total, correct = get_student_stats(req.student_id, req.file_id)
+    wrongs = get_wrong_summary(req.student_id, req.file_id)
+
+
+    accuracy = (correct / total) * 100 if total > 0 else 0
+
+    wrong_list = []
+    for w in wrongs:
+        wrong_list.append({
+            "question": w[0],
+            "times_wrong": w[1]
+    })
+
+
+    # Generate roadmap using Ollama
+    wrong_questions_text = "\n".join([f"- {w[0]}" for w in wrongs])
+
+    prompt = f"""
+You are a personalized learning assistant.
+
+A student attempted a quiz from faculty material and got these questions wrong:
+{wrong_questions_text}
+
+Generate:
+1. Weak topics inferred (bullet list)
+2. What to revise (bullet list)
+3. 5-step study roadmap (short)
+
+Keep it simple and student-friendly.
+"""
+
+    roadmap = "No wrong answers yet."
+    if len(wrongs) > 0:
+        response = ollama.chat(
+            model="llama3:8b",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        roadmap = response["message"]["content"]
+
+    return {
+        "student_id": req.student_id,
+        "file_id": req.file_id,
+        "total_attempted": total,
+        "correct": correct,
+        "accuracy": accuracy,
+        "wrong_questions": wrong_list,
+        "personalized_roadmap": roadmap
+    }
+class TeacherDashboardRequest(BaseModel):
+    file_id: str
+
+
+@app.post("/teacher-dashboard/")
+async def teacher_dashboard(req: TeacherDashboardRequest):
+    students = get_all_students(req.file_id)
+
+    report = []
+    for s in students:
+        total, correct, accuracy = get_student_summary(s, req.file_id)
+        report.append({
+            "student_id": s,
+            "attempted": total,
+            "correct": correct,
+            "accuracy": accuracy
+        })
+
+    return {
+        "file_id": req.file_id,
+        "student_report": report
+    }
+@app.post("/generate-adaptive-quiz/")
+async def generate_adaptive_quiz(req: AdaptiveQuizRequest):
+    collection = get_collection()
+
+    data = collection.get(where={"file_id": req.file_id})
+    docs = data["documents"]
+
+    if not docs:
+        return {"error": "No content found for this file_id"}
+
+    combined_text = "\n\n".join(docs[:30])
+
+    wrong_qs = get_recent_wrong_questions(req.student_id, req.file_id, limit=5)
+
+    wrong_text = "\n".join([f"- {q}" for q in wrong_qs])
+
+    prompt = f"""
+You are an adaptive quiz generator.
+
+A student previously got these questions wrong:
+{wrong_text if wrong_qs else "No previous wrong questions."}
+
+Task:
+Generate {req.num_questions} new MCQs focused on the student's weak areas.
+
+Rules:
+- Questions must be strictly based on the given material.
+- 4 options (A,B,C,D)
+- Give correct answer + 1-line explanation
+- Output ONLY valid JSON array (no extra text)
+
+Format:
+[
+  {{
+    "question": "...",
+    "options": {{
+      "A": "...",
+      "B": "...",
+      "C": "...",
+      "D": "..."
+    }},
+    "answer": "A",
+    "explanation": "..."
+  }}
+]
+
+Material:
+{combined_text}
+"""
+
+    response = ollama.chat(
+        model="llama3:8b",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = response["message"]["content"]
+
+    match = re.search(r'\[[\s\S]*\]', raw)
+
+    if not match:
+        return {"file_id": req.file_id, "quiz": [], "raw_output": raw}
+
+    json_text = match.group(0)
+
+    try:
+        quiz_list = json.loads(json_text)
+    except:
+        quiz_list = []
+
+    return {
+        "student_id": req.student_id,
         "file_id": req.file_id,
         "quiz": quiz_list
     }
